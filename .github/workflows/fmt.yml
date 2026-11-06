@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   format:
+    if: github.repository == 'hanxi/xiaomusic'
     runs-on: ubuntu-latest
     permissions:
       contents: write

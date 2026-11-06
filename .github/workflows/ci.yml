@@ -3,27 +3,36 @@ name: CI Workflow
 on:
   push:
     branches:
-      - "*" # 所有分支触发
-    tags:
-      - "v*"
+      - "*"
   workflow_dispatch:
-
-env:
-  VERSION_TAG: ${{ secrets.DOCKERHUB_USERNAME }}/xiaomusic:${{ github.ref_name }}
-  LATEST_TAG: ${{ secrets.DOCKERHUB_USERNAME }}/xiaomusic:latest
-  STABLE_TAG: ${{ secrets.DOCKERHUB_USERNAME }}/xiaomusic:stable
+    inputs:
+      publish:
+        description: Publish to Docker Hub (requires configured username and token)
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  # 构建多架构 Docker 镜像并在所有平台上运行基本测试
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install . ruff
+      - run: python -m unittest discover -s test -p test_auth_recovery.py -v
+      - run: ruff check xiaomusic/auth.py xiaomusic/device_manager.py xiaomusic/xiaomusic.py test/test_auth_recovery.py
+      - run: ruff format --check xiaomusic/auth.py xiaomusic/device_manager.py xiaomusic/xiaomusic.py test/test_auth_recovery.py
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        platform: [amd64, arm64, armv7]
         include:
           - platform: amd64
             arch: amd64
@@ -33,170 +42,91 @@ jobs:
             arch: arm/v7
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build Docker image for ${{ matrix.platform }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build without registry credentials
         uses: docker/build-push-action@v6
         with:
-          platforms: linux/${{ matrix.arch }}
           context: .
+          platforms: linux/${{ matrix.arch }}
           push: false
           load: true
-          tags: ${{ env.VERSION_TAG }}
+          tags: xiaomusic:ci
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-
-      - name: Test Docker image for ${{ matrix.platform }}
+      - name: Smoke test
+        run: docker run --rm --platform linux/${{ matrix.arch }} xiaomusic:ci /app/.venv/bin/python3 /app/xiaomusic.py -h
+      - name: Regression tests in image
         run: |
-          docker run --rm ${{ env.VERSION_TAG }} /app/.venv/bin/python3 /app/xiaomusic.py -h
-
-      - name: Save ${{ matrix.platform }} image to tar
-        run: |
-          docker save ${{ env.VERSION_TAG }} -o xiaomusic-${{ github.ref_name }}-${{ matrix.platform }}.tar
-
-      - name: Upload Docker images as artifacts
-        uses: actions/upload-artifact@v4
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            -v "$PWD/test:/app/test:ro" xiaomusic:ci \
+            /app/.venv/bin/python3 -m unittest discover -s test -p test_auth_recovery.py -v
+      - name: Save tested image
+        run: docker save xiaomusic:ci -o xiaomusic-${{ matrix.platform }}.tar
+      - uses: actions/upload-artifact@v4
         with:
-          name: docker-images-${{ matrix.platform }}
-          path: xiaomusic-${{ github.ref_name }}-${{ matrix.platform }}.tar
+          name: docker-image-${{ matrix.platform }}
+          path: xiaomusic-${{ matrix.platform }}.tar
           retention-days: 1
 
-  # 推送多架构 Docker 镜像到 Docker Hub
-  push-docker:
-    runs-on: ubuntu-latest
+  publish-docker:
+    name: Docker Hub publication
     needs: build
-    if: github.ref_name == 'main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
     steps:
+      - name: Check publication configuration
+        id: config
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          PUBLISH_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+        shell: bash
+        run: |
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "Docker Hub credentials are missing. Configure repository Actions variable DOCKERHUB_USERNAME and secret DOCKERHUB_TOKEN." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Docker Hub credentials are missing; no image has been published."
+          fi
+          if [[ "$PUBLISH_REQUESTED" != "true" ]]; then
+            echo "Build-only run: no image has been published. Run CI Workflow manually on main with publish enabled after configuring credentials." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "::error::Publication requested but DOCKERHUB_USERNAME or DOCKERHUB_TOKEN is missing."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Publish only from main to avoid overwriting stable tags from a feature branch."
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        if: steps.config.outputs.publish == 'true'
+      - uses: docker/setup-qemu-action@v3
+        if: steps.config.outputs.publish == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.config.outputs.publish == 'true'
+      - uses: docker/login-action@v3
+        if: steps.config.outputs.publish == 'true'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Publish to Docker Hub
-        if: github.ref_name == 'main'
+      - name: Publish tested revision
+        if: steps.config.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
           context: .
-          push: true
-          tags: ${{ env.VERSION_TAG }}
-          cache-from: |
-            type=gha,scope=amd64
-            type=gha,scope=arm64
-            type=gha,scope=armv7
-
-      - name: Publish to Docker Hub latest and stable
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/build-push-action@v6
-        with:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
-          context: .
           push: true
           tags: |
-            ${{ env.VERSION_TAG }}
-            ${{ env.LATEST_TAG }}
-            ${{ env.STABLE_TAG }}
+            ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic:main
+            ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic:sha-${{ github.sha }}
           cache-from: |
             type=gha,scope=amd64
             type=gha,scope=arm64
             type=gha,scope=armv7
-
-  # 推送镜像到 GitHub Release
-  publish-release:
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref_name == 'main' || startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: docker-images-*
-          merge-multiple: true
-
-      - name: Install GitHub CLI
-        run: |
-          sudo apt update
-          sudo apt install -y gh
-
-      - name: Create or update Release tag
+      - name: Publication summary
+        if: steps.config.outputs.publish == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RELEASE_NAME=${{ github.ref_name }}
-          RELEASE_BODY="This release is automatically updated from the ${RELEASE_NAME} branch."
-
-          EXISTING_RELEASE=$(gh release view "${RELEASE_NAME}" --json id --jq .id || echo "")
-
-          if [[ -n "${EXISTING_RELEASE}" ]]; then
-            echo "release exist"
-          else
-            gh release create "${RELEASE_NAME}" \
-              --prerelease=false \
-              --title "${RELEASE_NAME}" \
-              --notes "${RELEASE_BODY}"
-          fi
-
-      - name: Upload assets to Release tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RELEASE_NAME=${{ github.ref_name }}
-
-          FILES=$(find . -type f -name "xiaomusic-*.tar")
-          for FILE in ${FILES}; do
-            echo "type upload ${FILE}"
-            gh release upload "${RELEASE_NAME}" "${FILE}" --clobber
-          done
-
-  # 推送 PyPI 包
-  publish-pypi:
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: true
-
-      - uses: actions/setup-node@v4
-        with:
-          registry-url: https://registry.npmjs.org/
-          node-version: lts/*
-
-      - name: Generate changelog
-        run: npx changelogithub
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: pdm-project/setup-pdm@v3
-
-      - name: Publish package distributions to PyPI
-        run: pdm publish
-        continue-on-error: true
+          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic
+        run: echo "Published $IMAGE with latest, main and sha-$GITHUB_SHA tags." >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,51 @@
 # XiaoMusic: 无限听歌，解放小爱音箱
 
+## 此 fork：启动自愈与 Docker Hub 构建
+
+本 fork 修复主机重启时临时 DNS / 连接故障导致初始化失败后不再恢复的问题。
+启动会等待登录、设备列表和 cookie 完整初始化，失败后按 5、10、20、40、60 秒间隔重试，
+此后保持每 60 秒重试，网络恢复即可继续启动，不依赖打开设置页。
+`enable_pull_ask=False` 不受影响，也不需要为此开启语音轮询；关闭服务会取消重试。
+登录失败不会删除已有认证文件，也不能仅凭临时失败判断需要重新扫码。
+
+在此 fork 的 **Settings > Secrets and variables > Actions** 配置：
+
+| 类型 | 名称 | 内容 |
+| --- | --- | --- |
+| Repository variable（Variables 页） | `DOCKERHUB_USERNAME` | 实际 Docker Hub 用户名，不一定与 GitHub 用户名相同 |
+| Repository secret（Secrets 页） | `DOCKERHUB_TOKEN` | 有权推送该用户下 `xiaomusic` 仓库的 Docker Hub access token |
+
+不要把 token 写入代码、变量、日志或聊天。先在 Docker Hub 创建自己的 `xiaomusic` 仓库。
+进入本 fork **Actions > CI Workflow > Run workflow**，选择 `main`：
+不勾选 `publish` 时只运行回归测试和镜像构建，不需要 Docker Hub 凭据；
+填写凭据后勾选 `publish` 再运行，才会推送
+`DOCKERHUB_USERNAME/xiaomusic:latest`、`:main` 和 `:sha-<完整提交哈希>`。
+缺少凭据时构建仍可独立执行；明确请求发布却缺少凭据时发布任务会报错，不会假报发布成功。
+每次 push 也只构建，不自动发布；本 fork 不执行上游的 PyPI、Release、Pages 或镜像描述发布。
+工作流沿用上游的 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 构建与容器测试矩阵，
+是否构建成功以对应 Actions run 为准；成功构建的 tar 镜像可在该 run 的 Artifacts 下载（保留 1 天）。
+
+实际发布成功后，把现有 Compose 的 `image` 改为自己的镜像，保留原来的配置和音乐目录挂载：
+
+```yaml
+services:
+  xiaomusic:
+    image: YOUR_DOCKERHUB_USERNAME/xiaomusic:latest
+    container_name: xiaomusic
+    restart: always
+    ports:
+      - 58090:8090
+    volumes:
+      - /xiaomusic_music:/app/music
+      - /xiaomusic_conf:/app/conf
+```
+
+将 `YOUR_DOCKERHUB_USERNAME` 替换为实际用户名。已有实例先备份配置目录，再执行
+`docker compose pull xiaomusic` 和 `docker compose up -d xiaomusic` 升级，
+不要删除配置目录中的认证文件。需要固定版本时使用 `sha-<完整提交哈希>` 标签。
+本地回归测试：安装项目依赖后执行
+`python -m unittest discover -s test -p test_auth_recovery.py -v`。
+
 > [!IMPORTANT]
 > **📢 项目停止维护通知**
 >

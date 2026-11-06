@@ -138,8 +138,10 @@ class DeviceManager:
         Args:
             auth_manager: 认证管理器实例
         """
-        await auth_manager.try_update_device_id()
+        if await auth_manager.try_update_device_id() is None:
+            return False
         self._update_devices()
+        return True
 
     def set_devices(self, devices: dict[str, XiaoMusicDevice]):
         """设置设备实例字典

@@ -261,11 +261,17 @@ class XiaoMusic:
         assert (
             analytics_task is not None
         )  # to keep the reference to task, do not remove this
-        await self.auth_manager.init_all_data()
-        # 启动对话循环，传递回调函数
-        await self.conversation_poller.run_conversation_loop(
-            self.do_check_cmd, self.reset_timer_when_answer
-        )
+        try:
+            await self.auth_manager.init_until_ready()
+            # 启动对话循环，传递回调函数
+            await self.conversation_poller.run_conversation_loop(
+                self.do_check_cmd, self.reset_timer_when_answer
+            )
+        finally:
+            analytics_task.cancel()
+            await asyncio.gather(analytics_task, return_exceptions=True)
+            self.stop_file_watch()
+            await self.auth_manager.mi_session.close()
 
     # 匹配命令
     async def do_check_cmd(self, did="", query="", ctrl_panel=True, **kwargs):
@@ -695,12 +701,15 @@ class XiaoMusic:
         for handler in self.log.handlers:
             handler.close()
         self.setup_logger()
-        await self.auth_manager.init_all_data()
+        initialized = await self.auth_manager.init_all_data()
         self.music_library.gen_all_music_list()
         self.update_all_playlist()
 
         debug_config = deepcopy_data_no_sensitive_info(self.config)
-        self.log.info(f"reinit success. data:{debug_config}")
+        if initialized:
+            self.log.info(f"reinit success. data:{debug_config}")
+        else:
+            self.log.warning("reinit 未完成：认证、设备或 cookie 初始化失败")
 
     # 获取所有设备
     async def getalldevices(self, **kwargs):

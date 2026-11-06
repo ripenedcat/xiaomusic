@@ -25,6 +25,8 @@ from xiaomusic.utils.system_utils import (
 
 LOGIN_COOLDOWN_SEC = 30
 INIT_LOCK_TIMEOUT_SEC = 60
+INIT_RETRY_MIN_SEC = 5
+INIT_RETRY_MAX_SEC = 60
 
 
 class AuthManager:
@@ -53,16 +55,25 @@ class AuthManager:
 
     async def init_all_data(self, force_login=False):
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._init_all_data_with_lock(force_login),
                 timeout=INIT_LOCK_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
             self.log.warning("init_all_data 超时，可能被其他调用持有锁")
+            return False
+
+    async def init_until_ready(self):
+        delay = INIT_RETRY_MIN_SEC
+        while not await self.init_all_data():
+            self.log.warning("[AUTH] 初始化未完成，%s 秒后重试", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, INIT_RETRY_MAX_SEC)
+        self.log.info("[AUTH] 登录、设备和 cookie 初始化完成")
 
     async def _init_all_data_with_lock(self, force_login=False):
         async with self._init_lock:
-            await self._init_all_data_impl(force_login)
+            return await self._init_all_data_impl(force_login)
 
     async def _init_all_data_impl(self, force_login=False):
         self.mi_token_home = os.path.join(self.config.conf_path, ".mi.token")
@@ -83,24 +94,30 @@ class AuthManager:
             is_need_login = await self.need_login()
         is_can_login = await self.can_login()
         self.log.info(f"[AUTH] need_login={is_need_login}, can_login={is_can_login}")
+        if is_need_login and not is_can_login:
+            self.log.warning("[AUTH] 缺少登录配置，等待配置更新后重试")
+            return False
         if is_need_login and is_can_login:
             self.log.info("[AUTH] 需要登录，开始执行 login_miboy")
             login_ok = await self.login_miboy()
             if not login_ok:
                 self.log.warning("[AUTH] 登录失败，本次初始化中止")
-                return
+                return False
         else:
             self.log.info(
                 f"[AUTH] 无需登录 need_login:{is_need_login} can_login:{is_can_login}"
             )
-        await self.device_manager.update_device_info(self)
+        if not await self.device_manager.update_device_info(self):
+            return False
         cookie_jar = self.get_cookie()
         if cookie_jar:
             self.mi_session.cookie_jar.update_cookies(cookie_jar)
             self.log.info("[AUTH] cookie 已更新到 session")
         else:
             self.log.warning("[AUTH] get_cookie 返回 None，cookie 未更新")
+            return False
         self.cookie_jar = self.mi_session.cookie_jar
+        return True
 
     async def can_login(self):
         if self.config.account and self.config.password:
@@ -199,8 +216,8 @@ class AuthManager:
                     self._last_login_time = time.time()
                     self.log.warning(
                         "[AUTH-LOGIN] 最终登录失败，"
-                        "passToken 可能已过期或被吊销，"
-                        "建议重新扫码登录或检查网络"
+                        "可能是临时网络故障或认证问题，等待后续重试；"
+                        "不能仅凭本次失败判断 passToken 已失效"
                     )
                     return False
 
@@ -245,6 +262,7 @@ class AuthManager:
 
     async def _try_fresh_session_and_relogin(self, old_mi_account):
         self.log.info("[AUTH-FRESH] 尝试使用全新 session 重新登录...")
+        new_session = None
         try:
             old_session = self.mi_session
             new_session = ClientSession()
@@ -283,12 +301,14 @@ class AuthManager:
                 return True
             else:
                 self.log.warning("[AUTH-FRESH] 新 session 也失败了，关闭新 session")
-                await new_session.close()
                 return False
 
         except Exception as e:
             self.log.warning(f"[AUTH-FRESH] 过程异常: {e}")
             return False
+        finally:
+            if new_session is not None and self.mi_session is not new_session:
+                await new_session.close()
 
     def _patch_account(self, mi_account):
         original_mi_request = mi_account.mi_request
@@ -362,7 +382,7 @@ class AuthManager:
             return devices
         except Exception as e:
             self.log.warning(f"[AUTH] try_update_device_id 失败: {e}")
-            return {}
+            return None
 
     def set_token(self, account):
         auth_path = os.path.join(self.config.conf_path, "auth.json")
