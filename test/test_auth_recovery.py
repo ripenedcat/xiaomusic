@@ -22,6 +22,7 @@ class AuthRecoveryTests(unittest.IsolatedAsyncioTestCase):
             cookie="",
             mi_did="",
             devices={},
+            group_list="",
             enable_pull_ask=False,
             enable_file_watch=False,
         )
@@ -205,6 +206,7 @@ class AuthRecoveryTests(unittest.IsolatedAsyncioTestCase):
         app.config = self.config
         app.log = logging.getLogger(__name__)
         app.auth_manager = self.auth
+        app.device_manager = self.devices
         app.music_library = SimpleNamespace(try_gen_all_music_tag=Mock())
         app.crontab = SimpleNamespace(start=Mock())
         app.analytics = SimpleNamespace(send_startup_event=AsyncMock())
@@ -221,14 +223,29 @@ class AuthRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def conversation(*_callbacks):
             self.assertIsNotNone(self.auth.cookie_jar)
             self.assertFalse(self.config.enable_pull_ask)
+            self.assertTrue(app.did_exist("test-did"))
+            self.assertEqual(self.devices.get_did("test-device"), "test-did")
             ready.set()
             await asyncio.Event().wait()
 
         app.conversation_poller = SimpleNamespace(
             run_conversation_loop=AsyncMock(side_effect=conversation)
         )
+        del self.devices._update_devices
+        self.devices.xiaomusic = app
+        self.service.device_list.return_value = [
+            {
+                "deviceID": "test-device",
+                "miotDID": "test-did",
+                "hardware": "test-hardware",
+                "alias": "test-speaker",
+            }
+        ]
         self.auth.login_miboy = AsyncMock(return_value=False)
-        with patch("xiaomusic.auth.asyncio.sleep", side_effect=sleep):
+        with (
+            patch("xiaomusic.auth.asyncio.sleep", side_effect=sleep),
+            patch("xiaomusic.device_manager.XiaoMusicDevice", autospec=True),
+        ):
             task = asyncio.create_task(app.run_forever())
             try:
                 await asyncio.wait_for(sleeping.wait(), 2)
