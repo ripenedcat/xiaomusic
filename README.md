@@ -12,25 +12,26 @@
 
 | 类型 | 名称 | 内容 |
 | --- | --- | --- |
-| Repository variable（Variables 页） | `DOCKERHUB_USERNAME` | 实际 Docker Hub 用户名，不一定与 GitHub 用户名相同 |
-| Repository secret（Secrets 页） | `DOCKERHUB_TOKEN` | 有权推送该用户下 `xiaomusic` 仓库的 Docker Hub access token |
+| Repository variable（Variables 页） | `DOCKERHUB_USERNAME` | Docker Hub 登录用户名；兼容已保存的同名 Secret，Variable 优先 |
+| Repository secret（Secrets 页） | `DOCKERHUB_TOKEN` | 有权推送 `lucaslifes/lucasprivatehub` 的 Docker Hub access token |
 
-不要把 token 写入代码、变量、日志或聊天。先在 Docker Hub 创建自己的 `xiaomusic` 仓库。
+不要把 token 写入代码、变量、日志或聊天。
 进入本 fork **Actions > CI Workflow > Run workflow**，选择 `main`：
-不勾选 `publish` 时只运行回归测试和镜像构建，不需要 Docker Hub 凭据；
-填写凭据后勾选 `publish` 再运行，才会推送
-`DOCKERHUB_USERNAME/xiaomusic:latest`、`:main` 和 `:sha-<完整提交哈希>`。
+`publish` 默认勾选，`main` 的 push 也自动发布；取消勾选则只运行测试和构建，不需要 Docker Hub 凭据。
+非 `main` 分支不发布。唯一发布标签固定为 **`lucaslifes/lucasprivatehub:xiaomusic`**，
+不会因登录用户名变量变化而改变目标。各架构按 digest 上传，再合成该标签的多架构 manifest，
+不生成 `latest`、`main`、`sha-*` 或架构标签，也不删除共享仓库中其他项目的标签。
 缺少凭据时构建仍可独立执行；明确请求发布却缺少凭据时发布任务会报错，不会假报发布成功。
-每次 push 也只构建，不自动发布；本 fork 不执行上游的 PyPI、Release、Pages 或镜像描述发布。
+本 fork 不执行上游的 PyPI、Release、Pages 或镜像描述发布。
 工作流沿用上游的 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 构建与容器测试矩阵，
 是否构建成功以对应 Actions run 为准；成功构建的 tar 镜像可在该 run 的 Artifacts 下载（保留 1 天）。
 
-实际发布成功后，把现有 Compose 的 `image` 改为自己的镜像，保留原来的配置和音乐目录挂载：
+实际发布成功后，把现有 Compose 的 `image` 改为以下镜像，保留原来的配置和音乐目录挂载：
 
 ```yaml
 services:
   xiaomusic:
-    image: YOUR_DOCKERHUB_USERNAME/xiaomusic:latest
+    image: lucaslifes/lucasprivatehub:xiaomusic
     container_name: xiaomusic
     restart: always
     ports:
@@ -40,9 +41,10 @@ services:
       - /xiaomusic_conf:/app/conf
 ```
 
-将 `YOUR_DOCKERHUB_USERNAME` 替换为实际用户名。已有实例先备份配置目录，再执行
+已有实例先备份配置目录，再执行
 `docker compose pull xiaomusic` 和 `docker compose up -d xiaomusic` 升级，
-不要删除配置目录中的认证文件。需要固定版本时使用 `sha-<完整提交哈希>` 标签。
+不要删除配置目录中的认证文件。该标签随发布更新；需要固定版本时使用发布摘要中的
+`lucaslifes/lucasprivatehub@sha256:<manifest digest>`，不创建额外标签。
 本地回归测试：安装项目依赖后执行
 `python -m unittest discover -s test -p test_auth_recovery.py -v`。
 

@@ -9,7 +9,7 @@ on:
       publish:
         description: Publish to Docker Hub (requires configured username and token)
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -76,13 +76,16 @@ jobs:
     name: Docker Hub publication
     needs: build
     runs-on: ubuntu-latest
+    concurrency:
+      group: dockerhub-xiaomusic
+      cancel-in-progress: false
     steps:
       - name: Check publication configuration
         id: config
         env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          PUBLISH_REQUESTED: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+          PUBLISH_REQUESTED: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
         shell: bash
         run: |
           if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
@@ -90,7 +93,7 @@ jobs:
             echo "::warning::Docker Hub credentials are missing; no image has been published."
           fi
           if [[ "$PUBLISH_REQUESTED" != "true" ]]; then
-            echo "Build-only run: no image has been published. Run CI Workflow manually on main with publish enabled after configuring credentials." >> "$GITHUB_STEP_SUMMARY"
+            echo "Build-only run: no image has been published. Only main pushes and main manual runs with publish enabled publish." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
@@ -112,30 +115,50 @@ jobs:
       - uses: docker/login-action@v3
         if: steps.config.outputs.publish == 'true'
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Install digest-only image publisher
+        if: steps.config.outputs.publish == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq skopeo
       - name: Publish tested revision
         if: steps.config.outputs.publish == 'true'
         env:
-          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic
+          IMAGE: lucaslifes/lucasprivatehub
         shell: bash
         run: |
           set -euo pipefail
+          sources=()
           for platform in amd64 arm64 armv7; do
-            docker load -i "xiaomusic-$platform.tar"
-            docker tag xiaomusic:ci "$IMAGE:sha-$GITHUB_SHA-$platform"
-            docker push "$IMAGE:sha-$GITHUB_SHA-$platform"
+            archive="docker-archive:xiaomusic-$platform.tar"
+            digest=$(skopeo inspect --format '{{.Digest}}' "$archive")
+            skopeo copy --preserve-digests \
+              --authfile "$HOME/.docker/config.json" \
+              "$archive" "docker://$IMAGE@$digest"
+            sources+=("$IMAGE@$digest")
           done
           docker buildx imagetools create \
-            --tag "$IMAGE:sha-$GITHUB_SHA" \
-            --tag "$IMAGE:main" \
-            --tag "$IMAGE:latest" \
-            "$IMAGE:sha-$GITHUB_SHA-amd64" \
-            "$IMAGE:sha-$GITHUB_SHA-arm64" \
-            "$IMAGE:sha-$GITHUB_SHA-armv7"
-          docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA"
+            --tag "$IMAGE:xiaomusic" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:xiaomusic"
+          docker buildx imagetools inspect --raw "$IMAGE:xiaomusic" > manifest.json
+          python3 - <<'PY'
+          import json
+          with open("manifest.json") as file:
+              manifest = json.load(file)
+          platforms = {
+              (entry["platform"]["os"], entry["platform"]["architecture"],
+               entry["platform"].get("variant", ""))
+              for entry in manifest["manifests"]
+          }
+          assert len(platforms) == 3, platforms
+          assert any(os == "linux" and arch == "amd64" for os, arch, _ in platforms), platforms
+          assert any(os == "linux" and arch == "arm64" for os, arch, _ in platforms), platforms
+          assert ("linux", "arm", "v7") in platforms, platforms
+          print("Verified three-platform manifest:", sorted(platforms))
+          PY
       - name: Publication summary
         if: steps.config.outputs.publish == 'true'
         env:
-          IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/xiaomusic
-        run: echo "Published $IMAGE with latest, main and sha-$GITHUB_SHA tags." >> "$GITHUB_STEP_SUMMARY"
+          IMAGE: lucaslifes/lucasprivatehub:xiaomusic
+        run: |
+          echo "Published and verified $IMAGE (linux/amd64, linux/arm64, linux/arm/v7). No other tags were created." >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
